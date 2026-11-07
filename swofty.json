@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "id": "kizi.pitlane",
+  "name": "Manual Pit Lane",
+  "version": "0.3.6",
+  "author": "Kizi",
+  "description": "Drive the pit lane and park on your marks yourself while the crew does the stop. Use the game's Immersive pit stops; the quick-time event is removed. Ctrl+F7 switches it. Experimental.",
+  "license": "MIT",
+  "repository": "https://github.com/Kizikafuka/f1-25-manual-pit-lane",
+  "icon": "icon.png",
+  "category": "utility",
+  "kind": [
+    "native"
+  ],
+  "compat": {
+    "game": "f1_25",
+    "launcher": ">=1.8.19"
+  },
+  "requires": [
+    {
+      "id": "swofty.core",
+      "version": ">=0.1.0"
+    }
+  ],
+  "options": [
+    {
+      "id": "enabled",
+      "type": "toggle",
+      "label": "Drive the pit lane yourself",
+      "description": "On: the game no longer takes over your car in the pit lane. Ctrl+F7 switches it in a race.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "stop_mode",
+      "type": "choice",
+      "label": "Pit stop",
+      "description": "Manual: you park on your marks and the crew does the stop (use Immersive pit stops). AI parks the car: the AI drives you into the box. No flashback during a stop.",
+      "values": [
+        {
+          "value": "manual",
+          "label": "Manual (stop on your marks)"
+        },
+        {
+          "value": "ai",
+          "label": "AI parks the car"
+        }
+      ],
+      "default": "manual",
+      "binds": "native"
+    },
+    {
+      "id": "no_qte",
+      "type": "toggle",
+      "label": "Remove the pit stop quick-time event",
+      "description": "Hides the pit stop quick-time event for your car in the pit lane, like Broadcast, with no time lost.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "osd_message",
+      "type": "toggle",
+      "label": "On-screen messages",
+      "description": "Shows on-screen messages in the game's race notification.",
+      "default": true,
+      "binds": "native"
+    }
+  ],
+  "operations": {
+    "native": [
+      {
+        "dll": "native/kizi_pitlane.dll"
+      }
+    ]
+  }
+}

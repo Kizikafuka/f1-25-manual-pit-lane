@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "kizi.pitlane",
   "name": "Manual Pit Lane",
-  "version": "0.3.6",
+  "version": "0.3.9",
   "author": "Kizi",
   "description": "Drive the pit lane and park on your marks yourself while the crew does the stop. Use the game's Immersive pit stops; the quick-time event is removed. Ctrl+F7 switches it. Experimental.",
   "license": "MIT",

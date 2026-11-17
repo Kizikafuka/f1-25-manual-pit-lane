@@ -15,6 +15,7 @@
 //
 // Ctrl+F7 in game turns it on and off (two beeps on, one off, and a message in the race notification).
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <string>
@@ -200,7 +201,7 @@ const Site SITES[] = {
     {"C0 00 00 00 01 4C 8B AE 68 09 00 00 E8 ?? ?? ?? ?? 48 8B 00 40 80 FD 1A", 12, Src::BPL},  // +1032291 (1)
     {"24 40 40 88 6C 24 50 66 C7 44 24 52 07 00 48 89 7C 24 58 48 8B 48 08 48 8D 54 24 40 E8 ?? ?? ?? ?? C6 47 19 00 C5 78 29 07 48 C7 47 10 00 00 00 00 4C 8B B6 68 09 00 00 E8 ?? ?? ?? ?? 48 8B 00 40 80 FD 1A 0F 87 ?? ?? ?? ?? 48 89 C1 48 BA 00 00 00 00 04 00 00 00 48 21 D1 0F 85 ?? ?? ?? ??", 56, Src::BPL},  // +1032671 (1)
     {"84 AF 00 00 00 4C 8B B6 68 09 00 00 E8 ?? ?? ?? ?? 48 8B 00 40 80 FD 1A", 12, Src::BPL},  // +1032738 (1)
-    {"59 B7 38 02 45 89 E8 ?? ?? ?? ?? FD E8 ?? ?? ?? ?? F6 40 04 04 75 21 45 85 ED", 12, Src::R12_10A},  // +34afb2b (1)
+    {"45 89 E8 E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? F6 40 04 04 75 21 45 85 ED", 8, Src::R12_10A},  // +34afb2b (1); Oct-30 build: +34b777b
 };
 constexpr int MANUAL_BIT = 34;
 
@@ -438,7 +439,9 @@ float throttle(uintptr_t set)
 {
     uint64_t human = 0, out = 0;
     float t = 0;
-    return kizi::read(set + 0x20, human) && human && kizi::read(human + 8, out) && out && kizi::read(out + 0xc, t)
+    // +0x0c is the brake (1.0 while slowing into the box), +0x18 the throttle (seen in the 0.3.8 input log); 0.3.1-0.3.8
+    // read +0x0c here, so the stuck-after-the-tyres rescue never saw your throttle
+    return kizi::read(set + 0x20, human) && human && kizi::read(human + 8, out) && out && kizi::read(out + 0x18, t)
                ? t
                : 0;
 }
@@ -460,8 +463,15 @@ void worker()
         return;
     }
     bool manual_ok = install_manual();
-    bool button_ok = install_button(code, data);
-    bool noqte_ok = install_no_qte(code);
+    // The QTE removal and the PIT_LANE take-back are only right on top of the game's manual pit stop (its stop timing
+    // is 0 penalty there). If that did not install (game update), leave the game's pit flow completely alone: a removed
+    // QTE then gives late stops, and clearing PIT_LANE fights the AI pulling the car to the crew.
+    const bool degraded = stop_mode.get() == "manual" && !manual_ok;
+    if (degraded)
+        swofty::log("[pitlane] the manual stop is not installed on this game build: the game's own pit flow is left alone "
+                    "(no quick-time event removal, no pit lane take-back)");
+    bool button_ok = !degraded && install_button(code, data);
+    bool noqte_ok = !degraded && install_no_qte(code);
     swofty::log("[pitlane] remove the quick-time event %s", noqte_ok ? "installed" : "NOT found");
     swofty::log("[pitlane] pit stop quick-time event %s (%s)", button_ok ? "found" : "NOT found - press it yourself",
                 no_qte.get() ? "done for you in the pit lane" : "you press it");
@@ -471,6 +481,16 @@ void worker()
     int kept = 0;
     uint64_t car_hp = 0;                              // your human controller when the car was found
     DWORD still_since = 0, rescue_until = 0, window_at = 0, holdoff_until = 0;
+    // Settle guard (0.3.7). The game switches a car's controller itself at session start (garage placement), on unpause
+    // and on a flashback, and writing flags/mode at that moment crashed the game in ApplyInputs. So we only act (1) in a
+    // real pit lane visit (the car was moving when PIT_LANE appeared; a parked car being placed in its garage is
+    // left alone), (2) once the flags and mode have stayed unchanged for SETTLE_MS, and (3) we verify what we wrote and
+    // back off for a second when somebody else changed the car under us.
+    constexpr DWORD SETTLE_MS = 100;
+    DWORD visit_until = 0, last_moving = 0, changed_at = 0, backoff_until = 0;
+    uint32_t seen_fl = ~0u, seen_mode = ~0u, diag_last[24] = {};
+    DWORD diag_at = 0, tyres_at = 0;
+    bool stand_logged = false;
     Tyres at_entry;
     bool changed = false;
     // The game rebuilds the controllers on a flashback or Return to Garage. Writing into a stale set, or giving a car
@@ -478,6 +498,7 @@ void worker()
     auto drop = [&](const char *why) {
         swofty::log("[pitlane] your car's controller changed (%s): manual control released for 3 s", why);
         car = 0, in_pits = false, rescue_until = 0, window_at = 0, still_since = 0, changed = false;
+        visit_until = 0, last_moving = 0, seen_fl = seen_mode = ~0u;
         g_qte_until = 0, g_press_until = 0;
         if (g_noqte_flag)
             *g_noqte_flag = 0;
@@ -544,6 +565,35 @@ void worker()
                 swofty::log("[pitlane] your car: flags %#x -> %#x, mode %u -> %u", last_fl, fl, last_mode, mode);
             last_fl = fl, last_mode = mode;
         }
+        if (degraded)
+            continue;
+        DWORD tnow = GetTickCount();
+        if (int(visit_until - tnow) > 0 && int(tnow - diag_at) >= 200) {
+            // diagnostic (0.3.8, stuck boost after the pit exit): your human controller's input record while a pit visit
+            // is open, whenever it changed (24 dwords from [[set+0x20]+8]; +0xc brake, +0x18 throttle)
+            diag_at = tnow;
+            uint64_t hp2 = q(car + 0x20), out = hp2 ? q(hp2 + 8) : 0;
+            uint32_t w[24] = {};
+            if (out && kizi::read(out, w, sizeof w) && memcmp(w, diag_last, sizeof w) != 0) {
+                memcpy(diag_last, w, sizeof w);
+                std::string s;
+                char b[12];
+                for (uint32_t v : w)
+                    snprintf(b, sizeof b, " %08x", v), s += b;
+                swofty::log("[pitlane] input record%s (flags %#x, %.0f km/h)", s.c_str(), fl, car_kmh());
+            }
+        }
+        {   // settle guard: when did the flags / mode last change, and was the car moving lately?
+            uint32_t m = u32(car + live->mode) ^ u32(car + live->key);
+            if (fl != seen_fl || m != seen_mode)
+                seen_fl = fl, seen_mode = m, changed_at = tnow;
+            if (tick % 5 == 0) {
+                float k = car_kmh();
+                if (k > 15)
+                    last_moving = tnow;
+            }
+        }
+        bool settled = int(tnow - changed_at) >= int(SETTLE_MS) && int(backoff_until - tnow) <= 0;
         if (!on())
             continue;
         if (g_noqte_flag) {                            // your car, while the pit lane window is open
@@ -583,12 +633,17 @@ void worker()
                     bool new_objects = t.wear >= 0 && memcmp(t.obj, at_entry.obj, sizeof t.obj) != 0;
                     if (t.wear >= 0 && (new_objects || t.wear < at_entry.wear - 0.005f)) {
                         changed = true;
+                        tyres_at = now;
                         swofty::log("[pitlane] pit box: tyres changed (wear %.3f -> %.3f%s)", at_entry.wear, t.wear,
                                     new_objects ? ", new tyres" : "");
                     }
                 }
                 float kmh = car_kmh(), thr = throttle(car);
-                if (changed && kmh >= 0 && kmh < 1.5f && thr > 0.5f) {
+                if (tyres_at && kmh > 5) {            // how long the car was held in the box after the tyres
+                    swofty::log("[pitlane] pit box: the car left %.1f s after the tyres were changed", (now - tyres_at) / 1000.0);
+                    tyres_at = 0;
+                }
+                if (changed && settled && kmh >= 0 && kmh < 1.5f && thr > 0.5f) {
                     if (!still_since)
                         still_since = now;
                     else if (now - still_since > 500) {
@@ -610,12 +665,32 @@ void worker()
             in_pits = false;
             continue;
         }
+        if (int(visit_until - tnow) <= 0) {           // a new visit? only a car that was just driving counts
+            if (car_kmh() >= 0 && (!last_moving || int(tnow - last_moving) > 3000)) {
+                if (!stand_logged)
+                    swofty::log("[pitlane] PIT_LANE on a parked car (garage placement / unpause): left alone");
+                stand_logged = true;
+                continue;
+            }
+            stand_logged = false;
+        }
+        if (!settled)                                 // the game is still switching the controller: wait
+            continue;
+        visit_until = tnow + 120000;
         uint32_t rest = fl & ~bit;
+        if (u32(car + FLAGS) != fl || (u32(car + live->mode) ^ u32(car + live->key)) > 1)
+            continue;                                 // changed since we looked
         if (!kizi::write(car + FLAGS, &rest, 4))
             continue;
         if (!rest) {                                  // nothing else wants the AI: hand the car back to you
             uint32_t key = u32(car + live->key), mode = 0 ^ key;
             kizi::write(car + live->mode, &mode, 4);
+        }
+        if (u32(car + FLAGS) != rest) {               // somebody else wrote the flags at the same time
+            swofty::log("[pitlane] the car's flags changed under us (%#x, expected %#x): backing off for 1 s",
+                        u32(car + FLAGS), rest);
+            backoff_until = GetTickCount() + 1000;
+            continue;
         }
         if (!in_pits) {
             in_pits = true;
